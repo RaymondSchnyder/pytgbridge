@@ -1,24 +1,17 @@
-import irc.connection
-import irc.bot
+import pydle
 import socket
 import logging
-from jaraco.stream import buffer
 
 MESSAGE_SPLIT_LEN = 420
 
 class IRCEvent():
-	def __init__(self, orig, argname="message"):
-		self.nick, self.mask = orig.source.split("!")
-		self.channel = orig.target if orig.target.startswith("#") else None
-		setattr(self, argname, orig.arguments[0] if len(orig.arguments) > 0 else None)
+	def __init__(self, target, by, **kwargs):
+		self.nick, self.mask = by, "dummy.host.mask"
+		self.channel = target if target.startswith("#") else None
+		for k, v in kwargs.items():
+			setattr(self, k, v)
 
-class IRCBot(irc.bot.SingleServerIRCBot):
-	def __init__(self, args, kwargs={}, ns_password=None):
-		irc.bot.SingleServerIRCBot.__init__(self, *args, **kwargs)
-		self.connection.buffer_class = buffer.LenientDecodingLineBuffer
-		self.event_handlers = {}
-		self.ns_password = ns_password
-
+class MyBot(pydle.MinimalClient):
 	def _invoke_event_handler(self, name, args=(), kwargs={}):
 		if name not in self.event_handlers.keys():
 			logging.warning("Unhandeled '%s' event", name)
@@ -29,80 +22,65 @@ class IRCBot(irc.bot.SingleServerIRCBot):
 			logging.exception("Exception in IRC event handler")
 
 
-	def on_welcome(self, conn, event):
+	def on_connect(self):
 		logging.info("IRC connection established")
 		if self.ns_password is not None:
 			self.connection.privmsg("NickServ", "IDENTIFY " + self.ns_password)
 		self._invoke_event_handler("connected")
+	
+	def on_message(self, target, by, message):
+		self._invoke_event_handler("message", [IRCEvent(target, by, message=message)])
 
-	def on_nicknameinuse(self, conn, event):
-		self._invoke_event_handler("nick_in_use")
-
-	def on_privmsg(self, conn, event):
-		self._invoke_event_handler("message", (IRCEvent(event), ))
-
-	def on_pubmsg(self, conn, event):
-		self._invoke_event_handler("message", (IRCEvent(event), ))
-
-	def on_action(self, conn, event):
-		self._invoke_event_handler("action", (IRCEvent(event), ))
-
-	def on_join(self, conn, event):
-		if event.source.split("!")[0] == conn.get_nickname():
+	def on_ctcp(self, by, target, what, contents):
+		if what != "ACTION":
 			return
-		self._invoke_event_handler("join", (IRCEvent(event), ))
+		self._invoke_event_handler("action", [IRCEvent(target, by, message=contents)])
 
-	def on_part(self, conn, event):
-		self._invoke_event_handler("part", (IRCEvent(event), ))
-
-	def on_kick(self, conn, event):
-		if event.arguments[0] == conn.get_nickname():
-			conn.join(event.target)
+	def on_join(self, channel, user):
+		if user == self.nickname:
 			return
-		self._invoke_event_handler("kick", (IRCEvent(event, argname="othernick"), ))
+		self._invoke_event_handler("join", [IRCEvent(channel, user)])
 
-	def on_disconnect(self, conn, event):
-		logging.warning("IRC connection error, reconnecting")
-		self.jump_server()
+	def on_part(self, channel, user, message=None):
+		self._invoke_event_handler("part", [IRCEvent(channel, user)])
+
+	def on_kick(self, channel, target, by, reason=None):
+		if target == self.nickname:
+			self.join(channel)
+			return
+		self._invoke_event_handler("kick", [IRCEvent(channel, by, othernick=target)])
 
 class IRCClient():
 	def __init__(self, config):
 		# Read config
-		args = {}
-		args["ipv6"] = True if "ipv6" not in config.keys() else config["ipv6"]
+		args = (config["server"], config["port"])
+		kwargs = {}
 		if config["ssl"]:
-			args["wrapper"] = __import__("ssl").wrap_socket
-		# Resolve host
-		family = 0 if args["ipv6"] else socket.AF_INET
-		try:
-			ai = socket.getaddrinfo(config["server"], 0, family=family, proto=socket.IPPROTO_TCP)
-		except socket.gaierror as e:
-			logging.error("Failed to resolve hostname: %r", e)
-			exit(1)
-		args["ipv6"] = args["ipv6"] and ai[0][0] == socket.AF_INET6 # this determines the socket type used
-		host = ai[0][4][0]
-		# Actually create bot with correct params
-		kwargs = {"connect_factory": irc.connection.Factory(**args)}
-		args = [[(host, config["port"])], config["nick"], "pytgbridge (IRC)"]
-		ns_password = None if "nickpassword" not in config.keys() else config["nickpassword"]
-		self.bot = IRCBot(args, kwargs, ns_password=ns_password)
+			kwargs["tls"] = True
+			kwargs["tls_verify"] = False # this crashes it, lol
+		self.cargs = ( args, kwargs )
+		# Create bot
+		self.bot = MyBot(config["nick"], realname="pytgbridge (IRC)")
+		self.bot.event_handlers = {}
+		self.bot.ns_password = config.get("nickpassword", None)
 	def run(self):
-		self.bot.start()
+		self.bot.connect(*self.cargs[0], **self.cargs[1])
+		self.bot.handle_forever()
 	def event_handler(self, name, func):
 		self.bot.event_handlers[name] = func
 
 	def join(self, channel):
-		self.bot.connection.join(channel)
+		self.bot.join(channel)
 	def privmsg(self, target, message):
+		if self.bot.connection is None:
+			logging.warning("Dropping message(s) because IRC not connected yet")
+			return
 		if len(message) < MESSAGE_SPLIT_LEN:
 			msgs = [message]
 		else:
 			msgs = []
 			for i in range(0, len(message), MESSAGE_SPLIT_LEN):
 				msgs.append(message[i:i + MESSAGE_SPLIT_LEN])
-		try:
-			for m in msgs:
-				self.bot.connection.privmsg(target, m)
-		except irc.client.ServerNotConnectedError:
-			logging.warning("Dropping message because IRC not connected yet")
+		for m in msgs:
+			self.bot.message(target, m)
 
