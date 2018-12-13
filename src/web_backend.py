@@ -45,11 +45,12 @@ class WebBackend():
 			self.subdirs = config["use_subdirs"]
 		elif self.type == "builtin":
 			bind = config.get("bind", "127.0.0.1")
-			extern = config.get("external", bind)
 			port = config["port"]
+			baseurl = config.get("baseurl", "http://%s:%d" % (bind, port))
 			self.subdirs = config["use_subdirs"]
 			# Used by download_and_serve():
 			self.webpath = tempfile.mkdtemp()
+<<<<<<< HEAD
 			#SSL
 			self.ssl == config["ssl"]
 				if self.ssl == "true" 
@@ -59,6 +60,9 @@ class WebBackend():
 				else:
 					logging.error("Unknown if ssl should be used")
 					exit(1)
+=======
+			self.baseurl = baseurl
+>>>>>>> pr/2
 			t = threading.Thread(target=http_server_thread, args=(bind, port, self.webpath))
 			t.start()
 		elif self.type == "stub":
